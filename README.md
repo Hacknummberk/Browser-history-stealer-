@@ -166,6 +166,7 @@ The application generates several output files:
 
 This tool accesses sensitive browser history data. Use responsibly and ensure appropriate permissions before deployment.
 
-## License
-
-MIT License - Feel free to modify and distribute
+and use it at your own risk
+also you will need direct access to target machine. with Powershell or python version you do need direct physical Access to target
+do not blame me for trash code or error 
+i just feel like it to put it in github.
